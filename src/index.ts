@@ -8,8 +8,8 @@
  * static `deny` rules always win and are never touched.
  */
 import { Plugin } from "@opencode/plugin";
-import { readFile, writeFile } from "node:fs/promises";
-import { applyAnchorEdits } from "./apply.ts";
+import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { applyAnchorEdits, previewDiff, previewStats } from "./apply.ts";
 import { detectCovertWrite, summarizeFindings } from "./detect.ts";
 import { metricsFile, recordMetrics } from "./metrics.ts";
 
@@ -32,6 +32,19 @@ interface FileEdit {
   text: string;
   mode?: "insertAfter" | "replace";
   expectCount?: number;
+}
+
+/** Write via a sibling temp file and rename, preserving the file mode. */
+async function writeAtomic(path: string, data: string): Promise<void> {
+  const tmp = `${path}.patchflow-${process.pid}.tmp`;
+  try {
+    const mode = (await stat(path)).mode & 0o777;
+    await writeFile(tmp, data, { encoding: "utf8", mode });
+    await rename(tmp, path);
+  } catch (err) {
+    await unlink(tmp).catch(() => {});
+    throw err;
+  }
 }
 
 const SUGGEST =
@@ -107,6 +120,7 @@ export default Plugin.define({
           }
           const lines: string[] = [];
           const pending = new Map<string, string>();
+          const originals = new Map<string, string>();
           for (const [path, list] of byFile) {
             let original: string;
             try {
@@ -128,12 +142,31 @@ export default Plugin.define({
             } catch (err) {
               return { content: `patchflow: ${path}: ${String(err)}` };
             }
-            const added = next.split("\n").length - original.split("\n").length;
-            lines.push(`${dryRun ? "would update" : "updated"} ${path} (${list.length} edits, +${Math.max(0, added)} lines)`);
-            if (!dryRun) pending.set(path, next);
+            const delta = previewStats(original, next).addedLines;
+            const sign = delta >= 0 ? "+" : "";
+            lines.push(`${dryRun ? "would update" : "updated"} ${path} (${list.length} edits, ${sign}${delta} lines)`);
+            if (dryRun) lines.push(previewDiff(original, next));
+            else {
+              pending.set(path, next);
+              originals.set(path, original);
+            }
           }
           if (!dryRun) {
-            for (const [path, next] of pending) await writeFile(path, next, "utf8");
+            // Each write goes through temp+rename so a crash never leaves a
+            // truncated file; if a later file fails, restore the earlier ones
+            // so the batch stays all-or-nothing across files too.
+            const written: string[] = [];
+            try {
+              for (const [path, next] of pending) {
+                await writeAtomic(path, next);
+                written.push(path);
+              }
+            } catch (err) {
+              for (const path of written) {
+                await writeAtomic(path, originals.get(path) as string).catch(() => {});
+              }
+              return { content: `patchflow: write failed, batch rolled back: ${String(err)}` };
+            }
           }
           return { content: lines.join("\n") };
         },
